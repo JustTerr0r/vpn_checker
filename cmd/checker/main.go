@@ -11,7 +11,14 @@ import (
 
 	"vpn_checker/internal/checker"
 	"vpn_checker/internal/parser"
+	"vpn_checker/internal/web"
 )
+
+// ConfigEntry pairs the original raw URI line with its parsed form.
+type ConfigEntry struct {
+	RawURI string
+	Config parser.ProxyConfig
+}
 
 var (
 	colorReset  = "\033[0m"
@@ -29,23 +36,30 @@ func main() {
 	timeout := flag.Duration("t", 10*time.Second, "timeout per config check")
 	jsonOut := flag.Bool("json", false, "output results as JSON")
 	noColor := flag.Bool("no-color", false, "disable ANSI colors")
+	serveAddr := flag.String("serve", "", "serve alive configs on this address after check (e.g. :8080)")
 	flag.Parse()
 
 	if *noColor {
 		disableColors()
 	}
 
-	configs, err := readConfigs(*file)
+	entries, err := readConfigs(*file)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error reading configs: %v\n", err)
 		os.Exit(1)
 	}
-	if len(configs) == 0 {
+	if len(entries) == 0 {
 		fmt.Fprintln(os.Stderr, "no valid configs found")
 		os.Exit(1)
 	}
 
-	total := len(configs)
+	// extract []ProxyConfig for CheckAll (keeps checker package decoupled from raw URIs)
+	configs := make([]parser.ProxyConfig, len(entries))
+	for i, e := range entries {
+		configs[i] = e.Config
+	}
+
+	total := len(entries)
 	fmt.Fprintf(os.Stderr, "%s%sVPN Checker%s — %d configs, %d workers, timeout %s\n%s\n",
 		boldOn, colorCyan, colorReset, total, *workers, *timeout,
 		strings.Repeat("─", 80))
@@ -115,9 +129,23 @@ func main() {
 	} else {
 		printTable(results)
 	}
+
+	if *serveAddr != "" {
+		aliveEntries := buildAliveEntries(results, entries)
+		if len(aliveEntries) == 0 {
+			fmt.Fprintln(os.Stderr, "no alive configs to serve")
+			return
+		}
+		fmt.Fprintf(os.Stderr, "\n%sServing %d alive configs:%s\n  http://localhost%s/\n  http://localhost%s/configs\n",
+			colorCyan, len(aliveEntries), colorReset, *serveAddr, *serveAddr)
+		if err := web.Serve(*serveAddr, aliveEntries); err != nil {
+			fmt.Fprintf(os.Stderr, "server error: %v\n", err)
+			os.Exit(1)
+		}
+	}
 }
 
-func readConfigs(filePath string) ([]parser.ProxyConfig, error) {
+func readConfigs(filePath string) ([]ConfigEntry, error) {
 	var src *os.File
 	if filePath != "" {
 		f, err := os.Open(filePath)
@@ -130,7 +158,7 @@ func readConfigs(filePath string) ([]parser.ProxyConfig, error) {
 		src = os.Stdin
 	}
 
-	var configs []parser.ProxyConfig
+	var entries []ConfigEntry
 	scanner := bufio.NewScanner(src)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -138,9 +166,24 @@ func readConfigs(filePath string) ([]parser.ProxyConfig, error) {
 		if err != nil {
 			continue
 		}
-		configs = append(configs, cfg)
+		entries = append(entries, ConfigEntry{RawURI: line, Config: cfg})
 	}
-	return configs, scanner.Err()
+	return entries, scanner.Err()
+}
+
+func buildAliveEntries(results []checker.Result, entries []ConfigEntry) []web.AliveEntry {
+	var out []web.AliveEntry
+	for _, r := range results {
+		if !r.Alive {
+			continue
+		}
+		rawURI := ""
+		if r.Index >= 1 && r.Index <= len(entries) {
+			rawURI = entries[r.Index-1].RawURI
+		}
+		out = append(out, web.AliveEntry{Result: r, RawURI: rawURI})
+	}
+	return out
 }
 
 func printTable(results []checker.Result) {
