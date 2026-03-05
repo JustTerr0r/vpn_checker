@@ -37,6 +37,8 @@ func main() {
 	jsonOut := flag.Bool("json", false, "output results as JSON")
 	noColor := flag.Bool("no-color", false, "disable ANSI colors")
 	serveAddr := flag.String("serve", "", "serve alive configs on this address after check (e.g. :8080)")
+	interval := flag.Duration("interval", 5*time.Minute, "how often to re-check configs for changes (0 = no auto re-check; requires -f)")
+	recheck := flag.Duration("recheck", 10*time.Minute, "how often to re-validate already-alive configs and drop dead ones (0 = disabled)")
 	flag.Parse()
 
 	if *noColor {
@@ -53,7 +55,171 @@ func main() {
 		os.Exit(1)
 	}
 
-	// extract []ProxyConfig for CheckAll (keeps checker package decoupled from raw URIs)
+	// Create the web server immediately — it will serve live progress via SSE.
+	srv := web.NewServer(nil)
+
+	if *serveAddr != "" {
+		fmt.Fprintf(os.Stderr, "\n%sServing live results:%s\n  http://localhost%s/\n  http://localhost%s/configs\n\n",
+			colorCyan, colorReset, *serveAddr, *serveAddr)
+		go func() {
+			if err := srv.Serve(*serveAddr); err != nil {
+				fmt.Fprintf(os.Stderr, "server error: %v\n", err)
+				os.Exit(1)
+			}
+		}()
+	}
+
+	results := runCheck(entries, *workers, *timeout, srv)
+
+	if *jsonOut {
+		printJSON(results)
+	} else {
+		printTable(results)
+	}
+
+	if *serveAddr == "" {
+		return
+	}
+
+	// Launch background watcher if -interval > 0 and a file path was given.
+	if *interval > 0 && *file != "" {
+		go watchAndRecheck(*file, *workers, *timeout, *interval, srv)
+	} else if *interval > 0 && *file == "" {
+		fmt.Fprintln(os.Stderr, "note: -interval ignored when reading from stdin")
+	}
+
+	// Launch background re-validator for already-alive configs.
+	if *recheck > 0 {
+		go recheckLoop(*timeout, *recheck, srv)
+	}
+
+	// Block forever (server already running in goroutine).
+	select {}
+}
+
+// watchAndRecheck polls the file every interval. When the file's mtime changes
+// it re-reads configs, runs a fresh check, and updates the web server.
+func watchAndRecheck(filePath string, workers int, timeout, interval time.Duration, srv *web.Server) {
+	lastMtime := fileMtime(filePath)
+
+	for {
+		nextAt := time.Now().Add(interval)
+
+		// Update "next check in" countdown on the web page every 30s while waiting.
+		ticker := time.NewTicker(30 * time.Second)
+		timer := time.NewTimer(interval)
+
+	waitLoop:
+		for {
+			select {
+			case <-timer.C:
+				ticker.Stop()
+				break waitLoop
+			case <-ticker.C:
+				remaining := time.Until(nextAt).Round(time.Second)
+				srv.UpdateNextCheckIn(remaining.String())
+			}
+		}
+
+		// Check if file has changed.
+		mtime := fileMtime(filePath)
+		if mtime.Equal(lastMtime) {
+			fmt.Fprintf(os.Stderr, "\n%s[watcher]%s %s — no changes detected, skipping re-check\n",
+				colorGray, colorReset, time.Now().Format("15:04:05"))
+			srv.UpdateNextCheckIn(interval.String())
+			continue
+		}
+
+		lastMtime = mtime
+		fmt.Fprintf(os.Stderr, "\n%s[watcher]%s %s — file changed, re-checking configs…\n",
+			colorCyan, colorReset, time.Now().Format("15:04:05"))
+
+		entries, err := readConfigs(filePath)
+		if err != nil || len(entries) == 0 {
+			fmt.Fprintf(os.Stderr, "%s[watcher]%s error reading configs: %v\n", colorRed, colorReset, err)
+			continue
+		}
+
+		results := runCheck(entries, workers, timeout, srv)
+		aliveEntries := buildAliveEntries(results, entries)
+
+		nextCheckIn := interval.String()
+		srv.AppendEntries(aliveEntries, nextCheckIn)
+
+		fmt.Fprintf(os.Stderr, "%s[watcher]%s updated web server — %d alive configs\n",
+			colorGreen, colorReset, len(aliveEntries))
+	}
+}
+
+// recheckLoop cycles through alive entries from oldest to newest, re-validates
+// each one with a pause of (interval / total) between checks so the full cycle
+// takes approximately interval. Dead configs are removed from the web server.
+func recheckLoop(timeout, interval time.Duration, srv *web.Server) {
+	// pos tracks where in the list we left off across iterations.
+	pos := 0
+
+	for {
+		entries := srv.Entries()
+		if len(entries) == 0 {
+			time.Sleep(30 * time.Second)
+			pos = 0
+			continue
+		}
+
+		// Wrap around when we've reached the end.
+		if pos >= len(entries) {
+			pos = 0
+			entries = srv.Entries()
+			if len(entries) == 0 {
+				time.Sleep(30 * time.Second)
+				continue
+			}
+		}
+
+		e := entries[pos]
+		pos++
+
+		// Re-parse the raw URI to get a fresh ProxyConfig.
+		cfg, err := parser.ParseLine(e.RawURI)
+		if err != nil {
+			// Can't parse — treat as dead and remove.
+			srv.RemoveEntry(aliveEntryKey(e))
+			continue
+		}
+
+		r := checker.CheckConfig(0, cfg, timeout)
+		key := aliveEntryKey(e)
+
+		if r.Alive {
+			fmt.Fprintf(os.Stderr, "%s[recheck]%s ✔  %s — still alive (%dms)\n",
+				colorGreen, colorReset, truncate(e.Result.Name, 35), r.Latency.Milliseconds())
+		} else {
+			fmt.Fprintf(os.Stderr, "%s[recheck]%s ✘  %s — dead, removing (%s)\n",
+				colorRed, colorReset, truncate(e.Result.Name, 35), truncate(r.Error, 40))
+			srv.RemoveEntry(key)
+		}
+
+		// Spread checks evenly across the interval.
+		pause := interval / time.Duration(len(entries))
+		if pause < time.Second {
+			pause = time.Second
+		}
+		time.Sleep(pause)
+	}
+}
+
+// fileMtime returns the modification time of a file, or zero on error.
+func fileMtime(path string) time.Time {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}
+	}
+	return fi.ModTime()
+}
+
+// runCheck runs the full check pipeline and prints progress + summary to stderr.
+// If srv is non-nil, each result is published via SSE in real time.
+func runCheck(entries []ConfigEntry, workers int, timeout time.Duration, srv *web.Server) []checker.Result {
 	configs := make([]parser.ProxyConfig, len(entries))
 	for i, e := range entries {
 		configs[i] = e.Config
@@ -61,18 +227,19 @@ func main() {
 
 	total := len(entries)
 	fmt.Fprintf(os.Stderr, "%s%sVPN Checker%s — %d configs, %d workers, timeout %s\n%s\n",
-		boldOn, colorCyan, colorReset, total, *workers, *timeout,
+		boldOn, colorCyan, colorReset, total, workers, timeout,
 		strings.Repeat("─", 80))
+
+	if srv != nil {
+		srv.SetChecking(total)
+	}
 
 	startAll := time.Now()
 	alive := 0
 
-	// Progress callback — called under mutex after each result
 	onResult := func(r checker.Result, done, total int) {
-		// Clear the spinner/progress line
 		fmt.Fprintf(os.Stderr, "\r\033[K")
 
-		// Print result line immediately
 		if r.Alive {
 			alive++
 			fmt.Fprintf(os.Stderr, "%s[%3d/%-3d]%s %s✔%s  %-30s %s%-12s%s %s%dms%s  %s → %s%s\n",
@@ -94,7 +261,6 @@ func main() {
 			)
 		}
 
-		// Draw progress bar on next line
 		if done < total {
 			pct := float64(done) / float64(total)
 			barW := 40
@@ -103,15 +269,21 @@ func main() {
 			fmt.Fprintf(os.Stderr, "%s[%s] %3.0f%%  %d/%d done%s",
 				colorCyan, bar, pct*100, done, total, colorReset)
 		}
+
+		if srv != nil {
+			rawURI := ""
+			if r.Index >= 1 && r.Index <= len(entries) {
+				rawURI = entries[r.Index-1].RawURI
+			}
+			srv.PublishResult(web.AliveEntry{Result: r, RawURI: rawURI}, done, total)
+		}
 	}
 
-	// Initial progress bar
 	fmt.Fprintf(os.Stderr, "%s[%s] %3d%%  0/%d done%s",
 		colorCyan, strings.Repeat("░", 40), 0, total, colorReset)
 
-	results := checker.CheckAll(configs, *workers, *timeout, onResult)
+	results := checker.CheckAll(configs, workers, timeout, onResult)
 
-	// Clear progress bar line after done
 	fmt.Fprintf(os.Stderr, "\r\033[K")
 
 	elapsed := time.Since(startAll)
@@ -124,25 +296,11 @@ func main() {
 		colorRed, dead, colorReset,
 	)
 
-	if *jsonOut {
-		printJSON(results)
-	} else {
-		printTable(results)
+	if srv != nil {
+		srv.SetDone()
 	}
 
-	if *serveAddr != "" {
-		aliveEntries := buildAliveEntries(results, entries)
-		if len(aliveEntries) == 0 {
-			fmt.Fprintln(os.Stderr, "no alive configs to serve")
-			return
-		}
-		fmt.Fprintf(os.Stderr, "\n%sServing %d alive configs:%s\n  http://localhost%s/\n  http://localhost%s/configs\n",
-			colorCyan, len(aliveEntries), colorReset, *serveAddr, *serveAddr)
-		if err := web.Serve(*serveAddr, aliveEntries); err != nil {
-			fmt.Fprintf(os.Stderr, "server error: %v\n", err)
-			os.Exit(1)
-		}
-	}
+	return results
 }
 
 func readConfigs(filePath string) ([]ConfigEntry, error) {
@@ -272,6 +430,13 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return string(runes[:n-1]) + "…"
+}
+
+func aliveEntryKey(e web.AliveEntry) string {
+	if e.RawURI != "" {
+		return e.RawURI
+	}
+	return fmt.Sprintf("%s:%d", e.Result.Server, e.Result.Port)
 }
 
 func disableColors() {
