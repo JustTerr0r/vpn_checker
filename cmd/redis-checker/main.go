@@ -34,6 +34,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Railway injects $PORT; use it if -serve flag was not explicitly set.
+	if *serve == ":8081" {
+		if port := os.Getenv("PORT"); port != "" {
+			*serve = ":" + port
+		}
+	}
+
 	rc, err := pool.NewRedisClient(dsn)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: connect Redis: %v\n", err)
