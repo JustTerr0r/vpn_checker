@@ -318,6 +318,52 @@ func parseTrojan(raw string) (*TrojanConfig, error) {
 	}, nil
 }
 
+// RenameURI rewrites the display name inside a proxy URI to the given name.
+// For vless://, ss://, trojan:// it replaces the URL fragment.
+// For vmess:// it re-encodes the base64 JSON with the new "ps" field.
+// Returns the original URI unchanged on any error.
+func RenameURI(rawURI, name string) string {
+	switch {
+	case strings.HasPrefix(rawURI, "vmess://"):
+		return renameVmess(rawURI, name)
+	case strings.HasPrefix(rawURI, "vless://"),
+		strings.HasPrefix(rawURI, "ss://"),
+		strings.HasPrefix(rawURI, "trojan://"):
+		return renameFragment(rawURI, name)
+	}
+	return rawURI
+}
+
+// renameFragment replaces the #fragment part of a URI with url-encoded name.
+func renameFragment(rawURI, name string) string {
+	if idx := strings.IndexByte(rawURI, '#'); idx >= 0 {
+		rawURI = rawURI[:idx]
+	}
+	return rawURI + "#" + url.PathEscape(name)
+}
+
+// renameVmess decodes the vmess base64 JSON, sets ps=name, re-encodes.
+func renameVmess(rawURI, name string) string {
+	b64 := strings.TrimPrefix(rawURI, "vmess://")
+	if idx := strings.IndexByte(b64, '#'); idx >= 0 {
+		b64 = b64[:idx]
+	}
+	data, err := base64DecodeUserinfo(b64)
+	if err != nil {
+		return rawURI
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(data), &obj); err != nil {
+		return rawURI
+	}
+	obj["ps"] = name
+	encoded, err := json.Marshal(obj)
+	if err != nil {
+		return rawURI
+	}
+	return "vmess://" + base64.StdEncoding.EncodeToString(encoded)
+}
+
 // base64DecodeUserinfo tries standard and URL-safe base64 decoding
 func base64DecodeUserinfo(s string) (string, error) {
 	s, _ = url.QueryUnescape(s)

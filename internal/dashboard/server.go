@@ -2,12 +2,15 @@ package dashboard
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"vpn_checker/internal/parser"
 )
 
 // CheckedEntry is a live config result ready to display in the dashboard.
@@ -61,10 +64,11 @@ type sseEvent struct {
 }
 
 type serverState struct {
-	entries   []CheckedEntry
-	stats     Stats
-	checking  bool
-	checkedAt string
+	entries    []CheckedEntry
+	uriCountry map[string]string // rawURI → country code
+	stats      Stats
+	checking   bool
+	checkedAt  string
 }
 
 // Server is an HTTP dashboard with live SSE updates for the redis-checker.
@@ -91,6 +95,7 @@ func NewServer(getCheckedURIs func(context.Context) ([]string, error), cbs Grabb
 		grabCbs:        cbs,
 		grabStat:       GrabberStats{URLs: []string{}},
 		sseClients:     make(map[chan []byte]struct{}),
+		state:          serverState{uriCountry: make(map[string]string)},
 	}
 }
 
@@ -108,6 +113,9 @@ func (s *Server) PublishAlive(e CheckedEntry, stats Stats) {
 	s.mu.Lock()
 	s.state.entries = append(s.state.entries, e)
 	s.state.stats = stats
+	if e.Country != "" {
+		s.state.uriCountry[e.RawURI] = e.Country
+	}
 	s.mu.Unlock()
 	s.broadcast(sseEvent{Type: "alive", Entry: &e, Stats: stats})
 }
@@ -232,6 +240,7 @@ func (s *Server) handleClearChecked(w http.ResponseWriter, r *http.Request) {
 	// Also clear in-memory entries so dashboard table resets.
 	s.mu.Lock()
 	s.state.entries = nil
+	s.state.uriCountry = make(map[string]string)
 	s.state.stats.AliveCount = 0
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -341,8 +350,48 @@ func (s *Server) handleConfigs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("redis error: %v", err), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprint(w, strings.Join(uris, "\n"))
+
+	s.mu.RLock()
+	countryMap := s.state.uriCountry
+	s.mu.RUnlock()
+
+	renamed := make([]string, len(uris))
+	for i, uri := range uris {
+		country := countryMap[uri]
+		name := buildName(country)
+		renamed[i] = parser.RenameURI(uri, name)
+	}
+
+	// Expire = 10 years from now, effectively unlimited.
+	expire := time.Now().AddDate(10, 0, 0).Unix()
+
+	announce := "base64:" + base64.StdEncoding.EncodeToString(
+		[]byte("Вы пользуетесь бесплатной версией Babyl0n"))
+
+	body := strings.Join(renamed, "\n")
+
+	// Happ requires lowercase header names — bypass Go's canonicalization
+	// by writing the raw HTTP response directly.
+	hdr := w.Header()
+	hdr["Content-Type"] = []string{"text/plain; charset=utf-8"}
+	hdr["profile-title"] = []string{"Babyl0n Free"}
+	hdr["profile-update-interval"] = []string{"12"}
+	hdr["support-url"] = []string{"https://t.me/vabes"}
+	hdr["subscription-userinfo"] = []string{
+		fmt.Sprintf("upload=0; download=0; total=0; expire=%d", expire)}
+	hdr["announce"] = []string{announce}
+	hdr["content-disposition"] = []string{`attachment; filename="Babyl0n Free"`}
+	hdr["hide-settings"] = []string{"1"}
+	fmt.Fprint(w, body)
+}
+
+const configNameSuffix = " t.me/vpn0y - всегда рабочий VPN"
+
+func buildName(country string) string {
+	if country == "" {
+		return "VPN" + configNameSuffix
+	}
+	return country + configNameSuffix
 }
 
 const htmlPage = `<!DOCTYPE html>
