@@ -9,7 +9,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags="-s -w" \
-    -o /app/checker ./cmd/checker
+    -o /app/redis-checker ./cmd/redis-checker
 
 # ---- Runtime stage ----
 FROM alpine:3.19
@@ -24,6 +24,9 @@ RUN apk add --no-cache ca-certificates unzip wget && \
 
 WORKDIR /app
 
-COPY --from=builder /app/checker /app/checker
+COPY --from=builder /app/redis-checker /app/redis-checker
 
-ENTRYPOINT ["/app/checker"]
+EXPOSE 8081
+
+ENTRYPOINT ["/app/redis-checker"]
+CMD ["-recheck"]

@@ -1,2 +1,6 @@
 /.claude
 example_happ_subscription_handler.go
+checker
+pool-worker  
+redis-checker
+configs.txt
