@@ -149,8 +149,22 @@ func main() {
 
 	srv = dashboard.NewServer(rc.GetCheckedURIs, cbs)
 
-	fmt.Fprintf(os.Stderr, "[%s] [redis-checker] dashboard → http://localhost%s/\n",
-		ts(), *serve)
+	// Determine public URL for display
+	publicHost := os.Getenv("PUBLIC_HOST")
+	if publicHost == "" {
+		publicHost = "localhost"
+	}
+	port := (*serve)
+	if len(port) > 0 && port[0] == ':' {
+		port = port[1:]
+	}
+	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Fprintf(os.Stderr, "┌─────────────────────────────────────────┐\n")
+	fmt.Fprintf(os.Stderr, "│  Dashboard:  http://%s:%s/          \n", publicHost, port)
+	fmt.Fprintf(os.Stderr, "│  Configs:    http://%s:%s/configs   \n", publicHost, port)
+	fmt.Fprintf(os.Stderr, "└─────────────────────────────────────────┘\n")
+	fmt.Fprintf(os.Stderr, "\n")
+
 	go func() {
 		if err := srv.Serve(*serve); err != nil {
 			fmt.Fprintf(os.Stderr, "dashboard error: %v\n", err)
