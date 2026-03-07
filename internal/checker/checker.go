@@ -32,6 +32,7 @@ type Result struct {
 type ipAPIResponse struct {
 	Query       string `json:"query"`
 	CountryName string `json:"country"`
+	CountryCode string `json:"countryCode"`
 	Status      string `json:"status"`
 	Message     string `json:"message"`
 }
@@ -95,7 +96,7 @@ func CheckConfig(idx int, cfg parser.ProxyConfig, timeout time.Duration) Result 
 
 	// Measure latency via HTTP GET
 	start := time.Now()
-	resp, err := client.Get("http://ip-api.com/json")
+	resp, err := client.Get("http://ip-api.com/json?fields=status,message,query,country,countryCode")
 	if err != nil {
 		result.Error = fmt.Sprintf("http get: %v", err)
 		return result
@@ -122,7 +123,7 @@ func CheckConfig(idx int, cfg parser.ProxyConfig, timeout time.Duration) Result 
 
 	result.Alive = true
 	result.ExitIP = apiResp.Query
-	result.Country = apiResp.CountryName
+	result.Country = apiResp.CountryCode
 	return result
 }
 
