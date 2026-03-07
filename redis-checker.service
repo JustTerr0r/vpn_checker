@@ -6,12 +6,11 @@ After=network.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/opt/vpn_checker
-ExecStart=/opt/vpn_checker/redis-checker -recheck -workers 10 -timeout 15s -serve :8080
+ExecStart=/opt/vpn_checker/redis-checker -recheck -workers 10 -timeout 15s -serve 127.0.0.1:8081
 Restart=on-failure
 RestartSec=5s
 
 Environment=REDIS_URL=redis://default:PASSWORD@HOST:PORT
-Environment=PUBLIC_HOST=YOUR_VDS_IP
 
 # Logs: journalctl -u redis-checker -f
 StandardOutput=journal
