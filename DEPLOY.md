@@ -110,3 +110,14 @@ mv /tmp/redis-checker /opt/vpn_checker/redis-checker
 chmod +x /opt/vpn_checker/redis-checker
 systemctl start redis-checker
 ```
+
+# Локально
+GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" \
+    -o redis-checker ./cmd/redis-checker
+scp redis-checker root@95.140.148.197:/tmp/redis-checker
+
+# На сервере
+systemctl stop redis-checker
+mv /tmp/redis-checker /opt/vpn_checker/redis-checker
+chmod +x /opt/vpn_checker/redis-checker
+systemctl start redis-checker

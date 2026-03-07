@@ -37,12 +37,12 @@ type Stats struct {
 
 // GrabberStats is published via SSE and returned from /grabber/status.
 type GrabberStats struct {
-	Running   bool   `json:"running"`
-	URLs      []string `json:"urls"`
-	Interval  string `json:"interval"`
-	LastRun   string `json:"last_run,omitempty"`
-	LastAdded int64  `json:"last_added"`
-	TotalAdded int64 `json:"total_added"`
+	Running    bool     `json:"running"`
+	URLs       []string `json:"urls"`
+	Interval   string   `json:"interval"`
+	LastRun    string   `json:"last_run,omitempty"`
+	LastAdded  int64    `json:"last_added"`
+	TotalAdded int64    `json:"total_added"`
 }
 
 // GrabberCallbacks are provided by main to start/stop the grabber goroutine.
@@ -385,13 +385,22 @@ func (s *Server) handleConfigs(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, body)
 }
 
-const configNameSuffix = " t.me/vpn0y - всегда рабочий VPN"
+const configNameSuffix = " t.me/vpn0̸y - всегда рабочий VPN"
 
 func buildName(country string) string {
 	if country == "" {
-		return "VPN" + configNameSuffix
+		return "🌐 VPN" + configNameSuffix
 	}
-	return country + configNameSuffix
+	return countryFlag(country) + " " + country + configNameSuffix
+}
+
+func countryFlag(code string) string {
+	if len(code) != 2 {
+		return "🌐"
+	}
+	r0 := rune(code[0]-'A') + 0x1F1E6
+	r1 := rune(code[1]-'A') + 0x1F1E6
+	return string([]rune{r0, r1})
 }
 
 const htmlPage = `<!DOCTYPE html>
