@@ -1,6 +1,6 @@
 # VPN Checker — Project Documentation
 
-> Последнее обновление: 2026-03-06
+> Последнее обновление: 2026-03-10
 > Go module: `vpn_checker` | Go 1.22
 
 ---
@@ -141,22 +141,32 @@ go build -o redis-checker ./cmd/redis-checker/
 | `-workers` | 10 | Параллельные воркеры чека |
 | `-timeout` | 15s | Таймаут на один конфиг |
 | `-serve` | `:8081` | Адрес дашборда |
-| `-recheck` | false | Зациклить прогоны (loop forever) |
+| `-recheck` | false | Зациклить прогоны raw-чекера (loop forever) |
+| `-recheck-interval` | 0 (выкл) | Интервал актуализации `pool:checked` (напр. `30m`) |
+| `-recheck-workers` | 5 | Воркеры для актуализации `pool:checked` |
 
 **Пример:**
 ```bash
-./redis-checker -redis "redis://default:pass@host:port" -workers 10 -recheck
+./redis-checker -redis "redis://default:pass@host:port" -workers 10 -recheck \
+  -recheck-interval 30m -recheck-workers 5
 ```
 
 **Дашборд:** `http://localhost:8081/`
 
-**Логика чека:**
+**Логика raw-чекера (`runCheckLoop`):**
 1. `SMEMBERS pool:raw` → список URI
 2. Параллельные воркеры вызывают `processURI`
 3. `ParseLine` ошибка → `SREM pool:raw` + PublishDead
 4. `CheckConfig` мёртвый → `SREM pool:raw` + PublishDead
 5. `CheckConfig` живой → `ZADD pool:checked score=latencyMs` + PublishAlive (из `pool:raw` НЕ удаляется)
 6. После прогона: `SetDone`, если `-recheck` → следующий прогон
+
+**Логика актуализации (`runRecheckLoop`):**
+1. Тикер каждые `-recheck-interval`
+2. `ZRANGE pool:checked` → все живые URI
+3. Параллельные воркеры: `CheckConfig` каждого URI
+4. Живой → `ZADD pool:checked` с обновлённым score (latency)
+5. Мёртвый → `ZREM pool:checked` + лог
 
 ---
 
@@ -242,6 +252,7 @@ GetRawURIs(ctx) ([]string, error)                    // SMEMBERS pool:raw
 RemoveRawURI(ctx, uri string) error                  // SREM pool:raw
 AddCheckedURI(ctx, uri string, latencyMs float64)    // ZADD pool:checked
 GetCheckedURIs(ctx) ([]string, error)                // ZRANGE pool:checked 0 -1 (asc latency)
+RemoveCheckedURI(ctx, uri string) error              // ZREM pool:checked
 RawCount(ctx) (int64, error)                         // SCARD pool:raw
 CheckedCount(ctx) (int64, error)                     // ZCARD pool:checked
 ClearRaw(ctx) error                                  // DEL pool:raw
@@ -265,6 +276,8 @@ HTTP-дашборд для `redis-checker`. Не зависит напрямую
 | `stats` | Обновление статистики |
 | `done` | Прогон завершён |
 | `grabber` | Обновление статуса граббера |
+| `recheck` | Обновление статуса актуализации `pool:checked` |
+| `checker` | Обновление статуса raw-чекера |
 
 **HTTP endpoints:**
 | Метод | Путь | Описание |
@@ -277,6 +290,10 @@ HTTP-дашборд для `redis-checker`. Не зависит напрямую
 | GET | `/grabber/status` | Текущий статус граббера JSON |
 | POST | `/pool/clear-raw` | `DEL pool:raw` |
 | POST | `/pool/clear-checked` | `DEL pool:checked` + сброс таблицы |
+| POST | `/recheck/start` | Запустить актуализацию `{"interval":"30m","workers":5}` |
+| POST | `/recheck/stop` | Остановить актуализацию |
+| POST | `/checker/start` | Запустить raw-чекер из дашборда `{"workers":10}` |
+| POST | `/checker/stop` | Остановить raw-чекер |
 
 **`/configs` — Happ subscription endpoint:**
 
@@ -322,12 +339,19 @@ Entries() []AliveEntry
 
 ## Запуск всего вместе
 
-**Только `redis-checker`** (граббер управляется из дашборда):
+**Только `redis-checker`** (всё управляется из дашборда):
 ```bash
-./redis-checker -redis "redis://default:PASS@HOST:PORT" -workers 10 -recheck
+./redis-checker -redis "redis://default:PASS@HOST:PORT"
 # Открыть http://localhost:8081/
-# Вставить URL в панель Grabber → Start Grabber
-# Ждать заполнения pool:raw, чек запустится автоматически
+# Вставить URL в панель Grabber → Start Grabber (заполнение pool:raw)
+# Raw Checker → Start Checker (проверка pool:raw → pool:checked)
+# Recheck → Start Recheck, выбрать интервал (актуализация pool:checked)
+```
+
+**С флагами при старте** (без ручного управления через UI):
+```bash
+./redis-checker -redis "redis://..." -workers 10 -recheck \
+  -recheck-interval 30m -recheck-workers 5
 ```
 
 **С отдельным граббером:**
@@ -384,6 +408,8 @@ hdr["profile-title"] = []string{"Babyl0n Free"}  // НЕ w.Header().Set()
 
 - `uriCountry` map в dashboard живёт только в памяти — после перезапуска country для старых URI в Redis неизвестен (подставляется `VPN t.me/...`)
 - `pool:raw` содержит URI для чека, мёртвые удаляются. Живые **остаются** в `pool:raw` для следующего прогона
+- `runRecheckLoop` и `runCheckLoop` (запущенный из дашборда) используют `context.Background()` — независимы от основного сигнального контекста. Останавливаются только через кнопку Stop в UI или SIGINT
+- Recheck и Checker из дашборда не конфликтуют с raw-чекером, запущенным через флаги CLI — оба работают параллельно
 - Happ требует HTTPS — для dev использовать ngrok: `ngrok http 8081`
 - `hide-settings: 1` требует Provider ID `KKvkWFbv` в настройках Happ Provider
 - `cmd/checker` и `cmd/redis-checker` — независимые инструменты, не связаны между собой

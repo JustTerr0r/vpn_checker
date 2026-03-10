@@ -18,11 +18,13 @@ import (
 )
 
 func main() {
-	redisDSN := flag.String("redis", "", "Redis DSN (default: $REDIS_URL)")
-	workers  := flag.Int("workers", 10, "concurrent check workers")
-	timeout  := flag.Duration("timeout", 15*time.Second, "timeout per config check")
-	serve    := flag.String("serve", ":8081", "dashboard address")
-	recheck  := flag.Bool("recheck", false, "loop forever: restart from pool:raw after each full pass")
+	redisDSN        := flag.String("redis", "", "Redis DSN (default: $REDIS_URL)")
+	workers         := flag.Int("workers", 10, "concurrent check workers")
+	timeout         := flag.Duration("timeout", 15*time.Second, "timeout per config check")
+	serve           := flag.String("serve", ":8081", "dashboard address")
+	recheck         := flag.Bool("recheck", false, "loop forever: restart from pool:raw after each full pass")
+	recheckInterval := flag.Duration("recheck-interval", 0, "interval to recheck pool:checked (0 = disabled)")
+	recheckWorkers  := flag.Int("recheck-workers", 5, "workers for pool:checked recheck")
 	flag.Parse()
 
 	dsn := *redisDSN
@@ -92,6 +94,14 @@ func main() {
 	var grabLastAdded  atomic.Int64
 	var grabLastRun    atomic.Value // stores string
 
+	// Recheck state — controlled by dashboard HTTP handlers.
+	var recheckMu     sync.Mutex
+	var recheckCancel context.CancelFunc
+
+	// Raw checker state — controlled by dashboard HTTP handlers.
+	var checkerMu     sync.Mutex
+	var checkerCancel context.CancelFunc
+
 	cbs := dashboard.GrabberCallbacks{
 		Start: func(urls []string, interval time.Duration) error {
 			grabMu.Lock()
@@ -124,9 +134,7 @@ func main() {
 
 			go func() {
 				defer p.Close()
-				// Override pool's RunOnce to track stats via a wrapper ticker loop.
 				runGrabberLoop(ctx, p, interval, urls, srv, &grabTotalAdded, &grabLastAdded, &grabLastRun, &grabMu, &grabCancel)
-				// When done (stopped), publish stopped state.
 				gs2 := dashboard.GrabberStats{
 					Running:    false,
 					URLs:       urls,
@@ -144,6 +152,60 @@ func main() {
 		},
 		ClearRaw:     rc.ClearRaw,
 		ClearChecked: rc.ClearChecked,
+
+		RecheckStart: func(interval time.Duration, workers int) error {
+			recheckMu.Lock()
+			defer recheckMu.Unlock()
+			if recheckCancel != nil {
+				return fmt.Errorf("recheck already running")
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			recheckCancel = cancel
+			srv.PublishRecheck(dashboard.RecheckStats{Running: true, Interval: interval.String(), Workers: workers})
+			go func() {
+				runRecheckLoop(ctx, rc, srv, workers, *timeout, interval)
+				recheckMu.Lock()
+				recheckCancel = nil
+				recheckMu.Unlock()
+				srv.PublishRecheck(dashboard.RecheckStats{Running: false, Interval: interval.String(), Workers: workers})
+			}()
+			return nil
+		},
+		RecheckStop: func() {
+			recheckMu.Lock()
+			defer recheckMu.Unlock()
+			if recheckCancel != nil {
+				recheckCancel()
+				recheckCancel = nil
+			}
+		},
+
+		CheckerStart: func(workers int) error {
+			checkerMu.Lock()
+			defer checkerMu.Unlock()
+			if checkerCancel != nil {
+				return fmt.Errorf("checker already running")
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			checkerCancel = cancel
+			srv.PublishChecker(dashboard.CheckerStats{Running: true, Workers: workers})
+			go func() {
+				runCheckLoop(ctx, rc, srv, workers, *timeout, true)
+				checkerMu.Lock()
+				checkerCancel = nil
+				checkerMu.Unlock()
+				srv.PublishChecker(dashboard.CheckerStats{Running: false, Workers: workers})
+			}()
+			return nil
+		},
+		CheckerStop: func() {
+			checkerMu.Lock()
+			defer checkerMu.Unlock()
+			if checkerCancel != nil {
+				checkerCancel()
+				checkerCancel = nil
+			}
+		},
 	}
 	_ = grabberStart // replaced by cbs.Start above
 
@@ -175,7 +237,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	logf("[redis-checker] started — workers=%d timeout=%s recheck=%v", *workers, *timeout, *recheck)
+	if *recheckInterval > 0 {
+		go runRecheckLoop(ctx, rc, srv, *recheckWorkers, *timeout, *recheckInterval)
+	}
+
+	logf("[redis-checker] started — workers=%d timeout=%s recheck=%v recheck-interval=%s", *workers, *timeout, *recheck, *recheckInterval)
 	runCheckLoop(ctx, rc, srv, *workers, *timeout, *recheck)
 	logf("[redis-checker] stopped")
 }
@@ -396,6 +462,77 @@ func trunc(s string, n int) string {
 		return s
 	}
 	return string(r[:n-1]) + "…"
+}
+
+func runRecheckLoop(ctx context.Context, rc *pool.RedisClient, srv *dashboard.Server, workers int, timeout, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var totalRemoved, totalUpdated atomic.Int64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		uris, err := rc.GetCheckedURIs(ctx)
+		if err != nil || len(uris) == 0 {
+			continue
+		}
+		logf("[recheck] starting pass: %d checked URIs", len(uris))
+
+		jobs := make(chan string, len(uris))
+		for _, u := range uris {
+			jobs <- u
+		}
+		close(jobs)
+
+		var wg sync.WaitGroup
+		var removed, updated atomic.Int64
+
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for uri := range jobs {
+					if ctx.Err() != nil {
+						return
+					}
+					cfg, err := parser.ParseLine(uri)
+					if err != nil {
+						_ = rc.RemoveCheckedURI(ctx, uri)
+						removed.Add(1)
+						continue
+					}
+					result := checker.CheckConfig(0, cfg, timeout)
+					if result.Alive {
+						_ = rc.AddCheckedURI(ctx, uri, float64(result.Latency.Milliseconds()))
+						updated.Add(1)
+					} else {
+						_ = rc.RemoveCheckedURI(ctx, uri)
+						removed.Add(1)
+						logf("[recheck] ✘ removed: %s", trunc(result.Name, 40))
+					}
+				}
+			}()
+		}
+		wg.Wait()
+
+		totalRemoved.Add(removed.Load())
+		totalUpdated.Add(updated.Load())
+		lastRun := time.Now().Format("2006-01-02 15:04:05")
+		logf("[recheck] pass done — updated=%d removed=%d", updated.Load(), removed.Load())
+		srv.PublishRecheck(dashboard.RecheckStats{
+			Running:  true,
+			Interval: interval.String(),
+			Workers:  workers,
+			LastRun:  lastRun,
+			Removed:  totalRemoved.Load(),
+			Updated:  totalUpdated.Load(),
+		})
+	}
 }
 
 func ts() string {

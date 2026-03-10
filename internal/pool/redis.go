@@ -104,6 +104,14 @@ func (r *RedisClient) CheckedCount(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
+// RemoveCheckedURI removes a single URI from pool:checked via ZREM.
+func (r *RedisClient) RemoveCheckedURI(ctx context.Context, uri string) error {
+	if err := r.client.ZRem(ctx, checkedSetKey, uri).Err(); err != nil {
+		return fmt.Errorf("ZREM %s: %w", checkedSetKey, err)
+	}
+	return nil
+}
+
 // ClearRaw deletes all URIs from pool:raw (DEL key).
 func (r *RedisClient) ClearRaw(ctx context.Context) error {
 	if err := r.client.Del(ctx, rawSetKey).Err(); err != nil {

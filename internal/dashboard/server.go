@@ -45,22 +45,47 @@ type GrabberStats struct {
 	TotalAdded int64    `json:"total_added"`
 }
 
+// RecheckStats is published via SSE for the pool:checked recheck loop.
+type RecheckStats struct {
+	Running  bool   `json:"running"`
+	Interval string `json:"interval"`
+	Workers  int    `json:"workers"`
+	LastRun  string `json:"last_run,omitempty"`
+	Removed  int64  `json:"removed"`
+	Updated  int64  `json:"updated"`
+}
+
+// CheckerStats is published via SSE for the raw pool checker loop.
+type CheckerStats struct {
+	Running  bool   `json:"running"`
+	Workers  int    `json:"workers"`
+	LastRun  string `json:"last_run,omitempty"`
+}
+
 // GrabberCallbacks are provided by main to start/stop the grabber goroutine.
 type GrabberCallbacks struct {
 	Start        func(urls []string, interval time.Duration) error
 	Stop         func()
 	ClearRaw     func(ctx context.Context) error
 	ClearChecked func(ctx context.Context) error
+
+	RecheckStart func(interval time.Duration, workers int) error
+	RecheckStop  func()
+
+	CheckerStart func(workers int) error
+	CheckerStop  func()
 }
 
 // sseEvent is the wire format for Server-Sent Events.
 type sseEvent struct {
-	Type      string        `json:"type"` // "alive" | "dead" | "stats" | "done" | "grabber"
+	Type      string        `json:"type"` // "alive" | "dead" | "stats" | "done" | "grabber" | "recheck" | "checker"
 	Entry     *CheckedEntry `json:"entry,omitempty"`
 	URI       string        `json:"uri,omitempty"`
 	Stats     Stats         `json:"stats"`
 	CheckedAt string        `json:"checked_at,omitempty"`
 	Grabber   *GrabberStats `json:"grabber,omitempty"`
+	Recheck   *RecheckStats `json:"recheck,omitempty"`
+	Checker   *CheckerStats `json:"checker,omitempty"`
 }
 
 type serverState struct {
@@ -82,6 +107,14 @@ type Server struct {
 	grabMu   sync.Mutex
 	grabStat GrabberStats
 	grabCbs  GrabberCallbacks
+
+	// recheck state
+	recheckMu   sync.Mutex
+	recheckStat RecheckStats
+
+	// raw checker state
+	checkerMu   sync.Mutex
+	checkerStat CheckerStats
 
 	sseMu      sync.Mutex
 	sseClients map[chan []byte]struct{}
@@ -147,6 +180,22 @@ func (s *Server) PublishGrabber(gs GrabberStats) {
 	s.broadcast(sseEvent{Type: "grabber", Grabber: &gs})
 }
 
+// PublishRecheck updates recheck state and broadcasts it via SSE.
+func (s *Server) PublishRecheck(rs RecheckStats) {
+	s.recheckMu.Lock()
+	s.recheckStat = rs
+	s.recheckMu.Unlock()
+	s.broadcast(sseEvent{Type: "recheck", Recheck: &rs})
+}
+
+// PublishChecker updates raw checker state and broadcasts it via SSE.
+func (s *Server) PublishChecker(cs CheckerStats) {
+	s.checkerMu.Lock()
+	s.checkerStat = cs
+	s.checkerMu.Unlock()
+	s.broadcast(sseEvent{Type: "checker", Checker: &cs})
+}
+
 // Serve starts the HTTP dashboard on addr and blocks.
 func (s *Server) Serve(addr string) error {
 	mux := http.NewServeMux()
@@ -158,6 +207,10 @@ func (s *Server) Serve(addr string) error {
 	mux.HandleFunc("/grabber/status", s.handleGrabberStatus)
 	mux.HandleFunc("/pool/clear-raw", s.handleClearRaw)
 	mux.HandleFunc("/pool/clear-checked", s.handleClearChecked)
+	mux.HandleFunc("/recheck/start", s.handleRecheckStart)
+	mux.HandleFunc("/recheck/stop", s.handleRecheckStop)
+	mux.HandleFunc("/checker/start", s.handleCheckerStart)
+	mux.HandleFunc("/checker/stop", s.handleCheckerStop)
 	return http.ListenAndServe(addr, mux)
 }
 
@@ -247,6 +300,89 @@ func (s *Server) handleClearChecked(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "cleared"})
 }
 
+// ---- recheck HTTP handlers ----
+
+type recheckStartRequest struct {
+	Interval string `json:"interval"`
+	Workers  int    `json:"workers"`
+}
+
+func (s *Server) handleRecheckStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req recheckStartRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	interval := 30 * time.Minute
+	if req.Interval != "" {
+		if d, err := time.ParseDuration(req.Interval); err == nil {
+			interval = d
+		}
+	}
+	workers := req.Workers
+	if workers <= 0 {
+		workers = 5
+	}
+	if err := s.grabCbs.RecheckStart(interval, workers); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "started"})
+}
+
+func (s *Server) handleRecheckStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	s.grabCbs.RecheckStop()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
+}
+
+// ---- raw checker HTTP handlers ----
+
+type checkerStartRequest struct {
+	Workers int `json:"workers"`
+}
+
+func (s *Server) handleCheckerStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req checkerStartRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	workers := req.Workers
+	if workers <= 0 {
+		workers = 10
+	}
+	if err := s.grabCbs.CheckerStart(workers); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "started"})
+}
+
+func (s *Server) handleCheckerStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	s.grabCbs.CheckerStop()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
+}
+
 // ---- SSE broker ----
 
 func (s *Server) broadcast(ev sseEvent) {
@@ -315,6 +451,26 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	s.grabMu.Unlock()
 	{
 		ev := sseEvent{Type: "grabber", Grabber: &gs}
+		if data, err := json.Marshal(ev); err == nil {
+			fmt.Fprintf(w, "data: %s\n\n", data)
+		}
+	}
+	// Send recheck snapshot.
+	s.recheckMu.Lock()
+	rs := s.recheckStat
+	s.recheckMu.Unlock()
+	{
+		ev := sseEvent{Type: "recheck", Recheck: &rs}
+		if data, err := json.Marshal(ev); err == nil {
+			fmt.Fprintf(w, "data: %s\n\n", data)
+		}
+	}
+	// Send checker snapshot.
+	s.checkerMu.Lock()
+	cs := s.checkerStat
+	s.checkerMu.Unlock()
+	{
+		ev := sseEvent{Type: "checker", Checker: &cs}
 		if data, err := json.Marshal(ev); err == nil {
 			fmt.Fprintf(w, "data: %s\n\n", data)
 		}
@@ -562,6 +718,70 @@ col.c-uri{width:auto}
   </div>
 </div>
 
+<!-- Recheck panel -->
+<div class="grabber-panel" style="border-color:#1a3a6e">
+  <h2 style="color:#79c0ff">Recheck — pool:checked актуализация</h2>
+  <div class="grabber-stats">
+    <div class="grab-stat-card">
+      <div class="stat-value blue" id="recheckUpdated">–</div>
+      <div class="stat-label">Обновлено (живые)</div>
+    </div>
+    <div class="grab-stat-card">
+      <div class="stat-value red" id="recheckRemoved">–</div>
+      <div class="stat-label">Удалено (мёртвые)</div>
+    </div>
+    <div class="grab-stat-card">
+      <div class="stat-value gray" id="recheckLastRun">–</div>
+      <div class="stat-label">Последний запуск</div>
+    </div>
+    <div class="grab-stat-card">
+      <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.3rem">
+        <span class="pulse done" id="recheckPulse"></span>
+        <span class="stat-value gray" style="font-size:.9rem" id="recheckStatus">stopped</span>
+      </div>
+      <div class="stat-label">Статус</div>
+    </div>
+  </div>
+  <div class="grabber-form">
+    <div class="grabber-row">
+      <label style="margin:0">Интервал:</label>
+      <input type="text" id="recheckInterval" value="30m" title="e.g. 5m, 30m, 1h">
+      <label style="margin:0">Воркеры:</label>
+      <input type="text" id="recheckWorkers" value="5" style="width:55px">
+      <button class="btn" style="background:#1a3a6e" id="recheckStartBtn" onclick="recheckStart()">Start Recheck</button>
+      <button class="btn btn-danger" id="recheckStopBtn" onclick="recheckStop()" disabled>Stop</button>
+      <span class="grab-status" id="recheckMsg"></span>
+    </div>
+  </div>
+</div>
+
+<!-- Raw Checker panel -->
+<div class="grabber-panel" style="border-color:#0d3326">
+  <h2 style="color:#56d364">Raw Checker — pool:raw проверка</h2>
+  <div class="grabber-stats">
+    <div class="grab-stat-card">
+      <div class="stat-value gray" id="checkerLastRun">–</div>
+      <div class="stat-label">Последний запуск</div>
+    </div>
+    <div class="grab-stat-card">
+      <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.3rem">
+        <span class="pulse done" id="checkerPulse"></span>
+        <span class="stat-value gray" style="font-size:.9rem" id="checkerStatus">stopped</span>
+      </div>
+      <div class="stat-label">Статус</div>
+    </div>
+  </div>
+  <div class="grabber-form">
+    <div class="grabber-row">
+      <label style="margin:0">Воркеры:</label>
+      <input type="text" id="checkerWorkers" value="10" style="width:55px">
+      <button class="btn" style="background:#0d3326;border:1px solid #56d364" id="checkerStartBtn" onclick="checkerStart()">Start Checker</button>
+      <button class="btn btn-danger" id="checkerStopBtn" onclick="checkerStop()" disabled>Stop</button>
+      <span class="grab-status" id="checkerMsg"></span>
+    </div>
+  </div>
+</div>
+
 <div class="actions">
   <button class="btn" onclick="copyAll()">Copy all URIs</button>
   <a class="link" href="/configs" target="_blank">/configs (plain text, sorted by latency)</a>
@@ -707,6 +927,86 @@ function setGrabMsg(msg) {
   setTimeout(function(){ el.textContent = ''; }, 3000);
 }
 
+function setMsg(id, msg) {
+  var el = document.getElementById(id);
+  el.textContent = msg;
+  setTimeout(function(){ el.textContent = ''; }, 3000);
+}
+
+function updateRecheck(r) {
+  document.getElementById('recheckUpdated').textContent = r.updated !== undefined ? r.updated : '–';
+  document.getElementById('recheckRemoved').textContent = r.removed !== undefined ? r.removed : '–';
+  document.getElementById('recheckLastRun').textContent = r.last_run || '–';
+  var pulse = document.getElementById('recheckPulse');
+  var status = document.getElementById('recheckStatus');
+  var startBtn = document.getElementById('recheckStartBtn');
+  var stopBtn  = document.getElementById('recheckStopBtn');
+  if (r.running) {
+    pulse.className = 'pulse'; pulse.style.background = '#79c0ff';
+    status.textContent = 'running (' + (r.interval || '') + ')';
+    startBtn.disabled = true; stopBtn.disabled = false;
+    if (r.workers) document.getElementById('recheckWorkers').value = r.workers;
+    if (r.interval) document.getElementById('recheckInterval').value = r.interval;
+  } else {
+    pulse.className = 'pulse done'; pulse.style.background = '';
+    status.textContent = 'stopped';
+    startBtn.disabled = false; stopBtn.disabled = true;
+  }
+}
+
+function updateChecker(c) {
+  document.getElementById('checkerLastRun').textContent = c.last_run || '–';
+  var pulse = document.getElementById('checkerPulse');
+  var status = document.getElementById('checkerStatus');
+  var startBtn = document.getElementById('checkerStartBtn');
+  var stopBtn  = document.getElementById('checkerStopBtn');
+  if (c.running) {
+    pulse.className = 'pulse'; pulse.style.background = '#56d364';
+    status.textContent = 'running';
+    startBtn.disabled = true; stopBtn.disabled = false;
+    if (c.workers) document.getElementById('checkerWorkers').value = c.workers;
+  } else {
+    pulse.className = 'pulse done'; pulse.style.background = '';
+    status.textContent = 'stopped';
+    startBtn.disabled = false; stopBtn.disabled = true;
+  }
+}
+
+function recheckStart() {
+  var interval = document.getElementById('recheckInterval').value.trim() || '30m';
+  var workers  = parseInt(document.getElementById('recheckWorkers').value) || 5;
+  fetch('/recheck/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({interval: interval, workers: workers})
+  }).then(function(r){ return r.json(); }).then(function(d){
+    setMsg('recheckMsg', d.status || d.error || '');
+  }).catch(function(e){ setMsg('recheckMsg', 'error: '+e); });
+}
+
+function recheckStop() {
+  fetch('/recheck/stop', {method: 'POST'}).then(function(r){ return r.json(); }).then(function(d){
+    setMsg('recheckMsg', d.status || '');
+  }).catch(function(e){ setMsg('recheckMsg', 'error: '+e); });
+}
+
+function checkerStart() {
+  var workers = parseInt(document.getElementById('checkerWorkers').value) || 10;
+  fetch('/checker/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({workers: workers})
+  }).then(function(r){ return r.json(); }).then(function(d){
+    setMsg('checkerMsg', d.status || d.error || '');
+  }).catch(function(e){ setMsg('checkerMsg', 'error: '+e); });
+}
+
+function checkerStop() {
+  fetch('/checker/stop', {method: 'POST'}).then(function(r){ return r.json(); }).then(function(d){
+    setMsg('checkerMsg', d.status || '');
+  }).catch(function(e){ setMsg('checkerMsg', 'error: '+e); });
+}
+
 function connect() {
   var es = new EventSource('/events');
   es.onmessage = function(e) {
@@ -721,6 +1021,10 @@ function connect() {
       if (ev.checked_at) document.getElementById('checkedAt').textContent = 'Last checked: ' + ev.checked_at;
     } else if (ev.type === 'grabber' && ev.grabber) {
       updateGrabber(ev.grabber);
+    } else if (ev.type === 'recheck' && ev.recheck) {
+      updateRecheck(ev.recheck);
+    } else if (ev.type === 'checker' && ev.checker) {
+      updateChecker(ev.checker);
     }
   };
   es.onerror = function() {
