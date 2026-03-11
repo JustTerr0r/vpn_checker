@@ -156,8 +156,7 @@ scp redis-checker root@95.140.148.197:/tmp/
 
 # На сервере
 pm2 stop redis-checker
-sudo mv /tmp/redis-checker /opt/vpn_checker/redis-checker
-sudo chmod +x /opt/vpn_checker/redis-checker
+sudo install -m 755 /tmp/redis-checker /opt/vpn_checker/redis-checker
 pm2 start redis-checker
 ```
 

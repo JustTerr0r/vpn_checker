@@ -728,6 +728,11 @@ col.c-uri{width:auto}
     <div class="stat-value gray" id="statUnchecked">–</div>
     <div class="stat-label">Unchecked yet</div>
   </div>
+  <div class="stat-card">
+    <div class="stat-value" style="color:#a5d6ff" id="statConfigsCount">–</div>
+    <div class="stat-label">/configs count</div>
+    <button class="btn btn-danger" style="margin-top:.6rem;font-size:.72rem;padding:.2rem .6rem" onclick="clearChecked()">Clear /configs</button>
+  </div>
 </div>
 
 <div class="status-bar">
@@ -867,6 +872,13 @@ col.c-uri{width:auto}
 var rows = {};
 var allURIs = {};
 var rowCount = 0;
+var currentAlive = 0;
+var currentLimit = 0;
+
+function refreshConfigsCount() {
+  var n = currentLimit > 0 ? Math.min(currentAlive, currentLimit) : currentAlive;
+  document.getElementById('statConfigsCount').textContent = n;
+}
 
 function badgeClass(p) {
   return {vless:'vless',shadowsocks:'shadowsocks',vmess:'vmess',trojan:'trojan'}[p] || p;
@@ -905,6 +917,8 @@ function updateStats(s) {
   document.getElementById('statAlive').textContent     = s.AliveCount;
   document.getElementById('statDead').textContent      = s.DeadCount;
   document.getElementById('statUnchecked').textContent = Math.max(0, s.SessionTotal - s.SessionDone);
+  currentAlive = s.AliveCount || 0;
+  refreshConfigsCount();
   if (s.SessionTotal > 0) {
     var pct = Math.round(s.SessionDone / s.SessionTotal * 100);
     document.getElementById('progressFill').style.width = pct + '%';
@@ -1078,9 +1092,11 @@ function setConfigLimit() {
 }
 
 function updateConfigLimit(n) {
+  currentLimit = n || 0;
   document.getElementById('configLimit').value = n;
   var label = document.getElementById('configLimitLabel');
   label.textContent = n > 0 ? 'топ-' + n : 'все';
+  refreshConfigsCount();
 }
 
 function connect() {
