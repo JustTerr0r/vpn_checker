@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,14 +79,15 @@ type GrabberCallbacks struct {
 
 // sseEvent is the wire format for Server-Sent Events.
 type sseEvent struct {
-	Type      string        `json:"type"` // "alive" | "dead" | "stats" | "done" | "grabber" | "recheck" | "checker"
-	Entry     *CheckedEntry `json:"entry,omitempty"`
-	URI       string        `json:"uri,omitempty"`
-	Stats     Stats         `json:"stats"`
-	CheckedAt string        `json:"checked_at,omitempty"`
-	Grabber   *GrabberStats `json:"grabber,omitempty"`
-	Recheck   *RecheckStats `json:"recheck,omitempty"`
-	Checker   *CheckerStats `json:"checker,omitempty"`
+	Type        string        `json:"type"` // "alive" | "dead" | "stats" | "done" | "grabber" | "recheck" | "checker" | "config_limit"
+	Entry       *CheckedEntry `json:"entry,omitempty"`
+	URI         string        `json:"uri,omitempty"`
+	Stats       Stats         `json:"stats"`
+	CheckedAt   string        `json:"checked_at,omitempty"`
+	Grabber     *GrabberStats `json:"grabber,omitempty"`
+	Recheck     *RecheckStats `json:"recheck,omitempty"`
+	Checker     *CheckerStats `json:"checker,omitempty"`
+	ConfigLimit int           `json:"config_limit,omitempty"`
 }
 
 type serverState struct {
@@ -101,7 +103,11 @@ type Server struct {
 	mu    sync.RWMutex
 	state serverState
 
-	getCheckedURIs func(context.Context) ([]string, error)
+	getCheckedURIs func(ctx context.Context, limit int) ([]string, error)
+
+	// config limit (0 = all)
+	configLimitMu sync.RWMutex
+	configLimit   int
 
 	// grabber state
 	grabMu   sync.Mutex
@@ -122,7 +128,7 @@ type Server struct {
 
 // NewServer creates a dashboard Server.
 // getCheckedURIs is called on each GET /configs request to return sorted live URIs.
-func NewServer(getCheckedURIs func(context.Context) ([]string, error), cbs GrabberCallbacks) *Server {
+func NewServer(getCheckedURIs func(ctx context.Context, limit int) ([]string, error), cbs GrabberCallbacks) *Server {
 	return &Server{
 		getCheckedURIs: getCheckedURIs,
 		grabCbs:        cbs,
@@ -211,6 +217,7 @@ func (s *Server) Serve(addr string) error {
 	mux.HandleFunc("/recheck/stop", s.handleRecheckStop)
 	mux.HandleFunc("/checker/start", s.handleCheckerStart)
 	mux.HandleFunc("/checker/stop", s.handleCheckerStop)
+	mux.HandleFunc("/configs/limit", s.handleConfigsLimit)
 	return http.ListenAndServe(addr, mux)
 }
 
@@ -383,6 +390,33 @@ func (s *Server) handleCheckerStop(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
 }
 
+// ---- configs limit HTTP handler ----
+
+type configsLimitRequest struct {
+	Limit int `json:"limit"`
+}
+
+func (s *Server) handleConfigsLimit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req configsLimitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Limit < 0 {
+		req.Limit = 0
+	}
+	s.configLimitMu.Lock()
+	s.configLimit = req.Limit
+	s.configLimitMu.Unlock()
+	s.broadcast(sseEvent{Type: "config_limit", ConfigLimit: req.Limit})
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int{"limit": req.Limit})
+}
+
 // ---- SSE broker ----
 
 func (s *Server) broadcast(ev sseEvent) {
@@ -475,6 +509,16 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "data: %s\n\n", data)
 		}
 	}
+	// Send config limit snapshot.
+	s.configLimitMu.RLock()
+	cl := s.configLimit
+	s.configLimitMu.RUnlock()
+	{
+		ev := sseEvent{Type: "config_limit", ConfigLimit: cl}
+		if data, err := json.Marshal(ev); err == nil {
+			fmt.Fprintf(w, "data: %s\n\n", data)
+		}
+	}
 	flusher.Flush()
 
 	for {
@@ -501,7 +545,19 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfigs(w http.ResponseWriter, r *http.Request) {
-	uris, err := s.getCheckedURIs(r.Context())
+	// query param ?limit=N overrides server-side limit
+	limit := 0
+	if qs := r.URL.Query().Get("limit"); qs != "" {
+		if n, err := strconv.Atoi(qs); err == nil && n >= 0 {
+			limit = n
+		}
+	} else {
+		s.configLimitMu.RLock()
+		limit = s.configLimit
+		s.configLimitMu.RUnlock()
+	}
+
+	uris, err := s.getCheckedURIs(r.Context(), limit)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("redis error: %v", err), http.StatusInternalServerError)
 		return
@@ -785,6 +841,9 @@ col.c-uri{width:auto}
 <div class="actions">
   <button class="btn" onclick="copyAll()">Copy all URIs</button>
   <a class="link" href="/configs" target="_blank">/configs (plain text, sorted by latency)</a>
+  <input type="number" id="configLimit" value="0" min="0" style="width:60px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:.8rem;padding:.3rem .5rem;outline:none" title="0 = все конфиги">
+  <button class="btn btn-sm" onclick="setConfigLimit()">Применить</button>
+  <span id="configLimitLabel" style="font-size:.78rem;color:#8b949e"></span>
   <span class="alive-label"><span id="aliveCount">0</span> alive in table</span>
 </div>
 
@@ -1007,6 +1066,23 @@ function checkerStop() {
   }).catch(function(e){ setMsg('checkerMsg', 'error: '+e); });
 }
 
+function setConfigLimit() {
+  var n = parseInt(document.getElementById('configLimit').value) || 0;
+  fetch('/configs/limit', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({limit: n})
+  }).then(function(r){ return r.json(); }).then(function(d){
+    updateConfigLimit(d.limit !== undefined ? d.limit : n);
+  }).catch(function(e){ console.error('config limit error:', e); });
+}
+
+function updateConfigLimit(n) {
+  document.getElementById('configLimit').value = n;
+  var label = document.getElementById('configLimitLabel');
+  label.textContent = n > 0 ? 'топ-' + n : 'все';
+}
+
 function connect() {
   var es = new EventSource('/events');
   es.onmessage = function(e) {
@@ -1025,6 +1101,8 @@ function connect() {
       updateRecheck(ev.recheck);
     } else if (ev.type === 'checker' && ev.checker) {
       updateChecker(ev.checker);
+    } else if (ev.type === 'config_limit') {
+      updateConfigLimit(ev.config_limit || 0);
     }
   };
   es.onerror = function() {

@@ -209,7 +209,7 @@ func main() {
 	}
 	_ = grabberStart // replaced by cbs.Start above
 
-	srv = dashboard.NewServer(rc.GetCheckedURIs, cbs)
+	srv = dashboard.NewServer(rc.GetCheckedURIsTop, cbs)
 
 	// Determine public URL for display
 	publicHost := os.Getenv("PUBLIC_HOST")

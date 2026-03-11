@@ -152,7 +152,7 @@ sudo ufw enable
 # Локально
 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" \
     -o redis-checker ./cmd/redis-checker
-scp redis-checker user@YOUR_SERVER_IP:/tmp/
+scp redis-checker root@95.140.148.197:/tmp/
 
 # На сервере
 pm2 stop redis-checker

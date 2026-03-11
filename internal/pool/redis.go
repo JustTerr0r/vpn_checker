@@ -86,6 +86,20 @@ func (r *RedisClient) GetCheckedURIs(ctx context.Context) ([]string, error) {
 	return uris, nil
 }
 
+// GetCheckedURIsTop returns top N URIs from pool:checked sorted by latency (score asc).
+// If n <= 0, returns all URIs.
+func (r *RedisClient) GetCheckedURIsTop(ctx context.Context, n int) ([]string, error) {
+	stop := int64(-1)
+	if n > 0 {
+		stop = int64(n - 1)
+	}
+	uris, err := r.client.ZRange(ctx, checkedSetKey, 0, stop).Result()
+	if err != nil {
+		return nil, fmt.Errorf("ZRANGE %s: %w", checkedSetKey, err)
+	}
+	return uris, nil
+}
+
 // RawCount returns the number of URIs in pool:raw.
 func (r *RedisClient) RawCount(ctx context.Context) (int64, error) {
 	n, err := r.client.SCard(ctx, rawSetKey).Result()
