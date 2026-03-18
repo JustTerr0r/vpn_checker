@@ -218,6 +218,7 @@ func (s *Server) Serve(addr string) error {
 	mux.HandleFunc("/checker/start", s.handleCheckerStart)
 	mux.HandleFunc("/checker/stop", s.handleCheckerStop)
 	mux.HandleFunc("/configs/limit", s.handleConfigsLimit)
+	mux.HandleFunc("/api/stats", s.handleStats)
 	return http.ListenAndServe(addr, mux)
 }
 
@@ -415,6 +416,14 @@ func (s *Server) handleConfigsLimit(w http.ResponseWriter, r *http.Request) {
 	s.broadcast(sseEvent{Type: "config_limit", ConfigLimit: req.Limit})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int{"limit": req.Limit})
+}
+
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	stats := s.state.stats
+	s.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
 }
 
 // ---- SSE broker ----
@@ -709,6 +718,9 @@ col.c-uri{width:auto}
 <h1>Redis Pool Checker — Live</h1>
 <p class="meta" id="checkedAt">Connecting…</p>
 
+<div style="margin-bottom:.5rem">
+  <button class="btn" onclick="refreshStats()" id="refreshStatsBtn">Обновить</button>
+</div>
 <div class="stats-grid">
   <div class="stat-card">
     <div class="stat-value blue" id="statRaw">–</div>
@@ -1097,6 +1109,20 @@ function updateConfigLimit(n) {
   var label = document.getElementById('configLimitLabel');
   label.textContent = n > 0 ? 'топ-' + n : 'все';
   refreshConfigsCount();
+}
+
+function refreshStats() {
+  var btn = document.getElementById('refreshStatsBtn');
+  btn.disabled = true;
+  btn.textContent = '…';
+  fetch('/api/stats').then(function(r){ return r.json(); }).then(function(s){
+    updateStats(s);
+    btn.disabled = false;
+    btn.textContent = 'Обновить';
+  }).catch(function(e){
+    btn.disabled = false;
+    btn.textContent = 'Обновить';
+  });
 }
 
 function connect() {
