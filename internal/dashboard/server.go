@@ -213,6 +213,7 @@ func (s *Server) Serve(addr string) error {
 	mux.HandleFunc("/grabber/status", s.handleGrabberStatus)
 	mux.HandleFunc("/pool/clear-raw", s.handleClearRaw)
 	mux.HandleFunc("/pool/clear-checked", s.handleClearChecked)
+	mux.HandleFunc("/pool/reset-all", s.handleResetAll)
 	mux.HandleFunc("/recheck/start", s.handleRecheckStart)
 	mux.HandleFunc("/recheck/stop", s.handleRecheckStop)
 	mux.HandleFunc("/checker/start", s.handleCheckerStart)
@@ -306,6 +307,36 @@ func (s *Server) handleClearChecked(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "cleared"})
+}
+
+func (s *Server) handleResetAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	// Stop all running loops.
+	s.grabCbs.Stop()
+	s.grabCbs.CheckerStop()
+	s.grabCbs.RecheckStop()
+	// Clear both Redis keys.
+	if err := s.grabCbs.ClearRaw(r.Context()); err != nil {
+		http.Error(w, "clear raw: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := s.grabCbs.ClearChecked(r.Context()); err != nil {
+		http.Error(w, "clear checked: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Reset in-memory state.
+	s.mu.Lock()
+	s.state.entries = nil
+	s.state.uriCountry = make(map[string]string)
+	s.state.stats = Stats{}
+	s.state.checking = false
+	s.state.checkedAt = ""
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "reset"})
 }
 
 // ---- recheck HTTP handlers ----
@@ -718,8 +749,10 @@ col.c-uri{width:auto}
 <h1>Redis Pool Checker — Live</h1>
 <p class="meta" id="checkedAt">Connecting…</p>
 
-<div style="margin-bottom:.5rem">
+<div style="margin-bottom:.5rem;display:flex;gap:.6rem;align-items:center">
   <button class="btn" onclick="refreshStats()" id="refreshStatsBtn">Обновить</button>
+  <button class="btn btn-danger" onclick="resetAll()" id="resetAllBtn">⟳ Reset All</button>
+  <span id="resetAllMsg" style="font-size:.78rem;color:#8b949e"></span>
 </div>
 <div class="stats-grid">
   <div class="stat-card">
@@ -1122,6 +1155,40 @@ function refreshStats() {
   }).catch(function(e){
     btn.disabled = false;
     btn.textContent = 'Обновить';
+  });
+}
+
+function resetAll() {
+  if (!confirm('Остановить все процессы и очистить pool:raw + pool:checked?')) return;
+  var btn = document.getElementById('resetAllBtn');
+  var msg = document.getElementById('resetAllMsg');
+  btn.disabled = true;
+  btn.textContent = '…';
+  fetch('/pool/reset-all', {method:'POST'}).then(function(r){ return r.json(); }).then(function(d){
+    if (d.status === 'reset') {
+      rows = {}; allURIs = {}; rowCount = 0;
+      document.getElementById('tbody').innerHTML = '';
+      document.getElementById('aliveCount').textContent = '0';
+      document.getElementById('statRaw').textContent = '0';
+      document.getElementById('statAlive').textContent = '0';
+      document.getElementById('statDead').textContent = '0';
+      document.getElementById('statUnchecked').textContent = '0';
+      document.getElementById('statConfigsCount').textContent = '0';
+      document.getElementById('progressFill').style.width = '0%';
+      document.getElementById('progressText').textContent = '';
+      document.getElementById('statusLabel').textContent = 'reset';
+      document.getElementById('checkedAt').textContent = '';
+      msg.textContent = 'Сброшено';
+      setTimeout(function(){ msg.textContent = ''; }, 3000);
+    } else {
+      msg.textContent = d.error || 'error';
+    }
+    btn.disabled = false;
+    btn.textContent = '⟳ Reset All';
+  }).catch(function(e){
+    msg.textContent = 'error: ' + e;
+    btn.disabled = false;
+    btn.textContent = '⟳ Reset All';
   });
 }
 
